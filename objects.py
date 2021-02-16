@@ -1,9 +1,10 @@
+import re
 from abc import abstractmethod, ABC
 import os
 import collections
 import hashlib
 import zlib
-from repository import repo_file
+from repository import repo_dir, repo_file, repo_find
 
 class GitObject(ABC):
     """
@@ -79,9 +80,87 @@ def object_read(repo, sha):
         return c(repo, raw[y+1:])
 
 
+def object_resolve(repo, name):
+    """
+    Resolve name to an object hash in repo.
+
+    This function is aware of:
+
+    - the HEAD literal
+    - short and long hashes
+    - tags
+    - branches
+    - remote branches
+    """
+    candidates = list()
+    hashRE = re.compile(r"^[0-9A-Fa-f]{1,16}$")
+    smallHashRE = re.compile(r"^[0-9A-Fa-f]{1,16}$")
+
+    # Empty string?  Abort.
+    if not name.strip():
+        return None
+
+    # Head is nonambiguous
+    if name == "HEAD":
+        return [ ref_resolve(repo, "HEAD") ]
+
+
+    if hashRE.match(name):
+        if len(name) == 40:
+            # This is a complete hash
+            return [ name.lower() ]
+        elif len(name) >= 4:
+            # This is a small hash 4 seems to be the minimal length
+            # for git to consider something a short hash.
+            # This limit is documented in man git-rev-parse
+            name = name.lower()
+            prefix = name[0:2]
+            path = repo_dir(repo, "objects", prefix, mkdir=False)
+            if path:
+                rem = name[2:]
+                for f in os.listdir(path):
+                    if f.startswith(rem):
+                        candidates.append(prefix + f)
+
+    return candidates
+
+
 def object_find(repo, name, fmt=None, follow=True):
-    """Placeholder"""
-    return name
+    """
+    - If name is HEAD, it will just resolve .git/HEAD;
+    - If name is a full hash, this hash is returned unmodified.
+    - If name looks like a short hash, it will collect objects whose full hash begin with this short hash.
+    At last, it will resolve tags and branches matching name.
+    """
+    sha = object_resolve(repo, name)
+
+    if not sha:
+        raise Exception("No such reference {0}.".format(name))
+
+    if len(sha) > 1:
+        raise Exception("Ambiguous reference {0}: Candidates are:\n - {1}.".format(name,  "\n - ".join(sha)))
+
+    sha = sha[0]
+
+    if not fmt:
+        return sha
+
+    while True:
+        obj = object_read(repo, sha)
+
+        if obj.fmt == fmt:
+            return sha
+
+        if not follow:
+            return None
+
+        # Follow tags
+        if obj.fmt == b'tag':
+            sha = obj.kvlm[b'object'].decode("ascii")
+        elif obj.fmt == b'commit' and fmt == b'tree':
+            sha = obj.kvlm[b'tree'].decode("ascii")
+        else:
+            return None 
 
 
 def object_write(obj, actually_write=True):
@@ -349,3 +428,88 @@ def tree_checkout(repo, tree, path):
         elif obj.fmt == b'blob':
             with open(dest, 'wb') as f:
                 f.write(obj.blobdata)
+
+
+
+
+class GitTag(GitCommit):
+    """
+    REFS:
+    reft are a type of file stored in .git/refs. They contain hexadeciman hashcodes of objects encoded in ASCII. 
+
+    Eq.: 6071c08bcb4757d8c89a30d9755d2466cef8c1de
+    They can also refer to another reference (which makes them indirect refs):
+    ref: refs/remotes/origin/master
+
+
+    TAGS:
+    Tags are user defined names for objects, often commits. 
+    Tags are actually refs. They live in .git/refs/tags.
+
+    Lightweight tags: 
+    are just regular refs to a commit, tree or blob.
+
+    Tag objects:
+    are regular refs pointing to an object of type tag. Unlike lightweight tags, tag objects have an author, a date, an optional PGP signature and an optional annotation. Their format is the same as a commit object.
+
+
+    BRANCHES:
+    Commits are grouped in branches, and that at every point in time there’s a commit that’s HEAD, ie, the head commit of the current branch.
+
+    A branch is a reference to a commit. You could even say that a branch is a kind of a name for a commit. In this regard, a branch is exactly the same thing as a tag. Tags are refs that live in .git/refs/tags, branches are refs that live in .git/refs/heads.
+
+    Branches are references to a commit, tags can refer to any object;
+    But most importantly, the branch ref is updated at each commit. 
+    This means that whenever you commit, Git actually does this:
+    1. a new commit object is created, with the current branch’s ID as its parent;
+    2. the commit object is hashed and stored;
+    3. the branch ref is updated to refer to the new commit’s hash.
+    
+    But what about the current branch? It’s actually even easier. It’s a ref file outside of the refs hierarchy, in .git/HEAD, which is an indirect ref (that is, it is of the form ref: path/to/other/ref, and not a simple hash).
+    """
+
+    fmt = b'tag'
+
+
+def ref_resolve(repo, ref):
+    with open(repo_file(repo, ref), 'r') as fp:
+        data = fp.read().rstrip()
+        if data.startswith("ref: "):
+            return ref_resolve(repo, data[5:])
+        else:
+            return data
+
+            
+def ref_list(repo, path=None):
+    if not path:
+        path = repo_find(repo, "refs")
+    ret = collections.OrderedDict()
+    
+    for f in sorted(os.listdir(path)):
+        can = os.path.join(path, f)
+        if os.path.isdir(can):
+            ret[f] = ref_list(repo, can)
+        else:
+            ret[f] = ref_resolve(repo, can)
+    
+    return ret
+
+
+def ref_show(repo, refs, with_hash=True, prefix=""):
+    for k, v in refs.items():
+        if type(v) == str:
+            print ("{0}{1}{2}".format(
+                v + " " if with_hash else "",
+                prefix + "/" if prefix else "",
+                k))
+        else:
+            ref_show(repo, v, with_hash=with_hash, prefix="{0}{1}{2}".format(prefix, "/" if prefix else "", k))
+
+            
+def tag_create(name, obj, type):
+    # TODO
+    raise NotImplementedError()
+
+
+
+        
